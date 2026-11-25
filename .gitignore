@@ -1,0 +1,9 @@
+build/*
+libraries/*
+build-sln/*
+.vs/*
+.vscode/*
+res/volumes*
+res/3D textures/*
+imgui.ini
+/out/
