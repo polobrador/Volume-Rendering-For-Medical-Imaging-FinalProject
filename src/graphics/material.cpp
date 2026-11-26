@@ -11,6 +11,8 @@ VolumeMaterial::VolumeMaterial(glm::vec4 color)
 {
 	this->color = color;
 	this->shader = Shader::Get("res/shaders/basic.vs", "res/shaders/homogeneous.fs");
+	this->vdbShader = this->shader;
+	this->dicomShader = Shader::Get("res/shaders/basic.vs", "res/shaders/dicom_volume.fs");
 	loadVDB("res/3D textures/bunny_cloud.vdb");
 }
 
@@ -33,9 +35,25 @@ void VolumeMaterial::setUniforms(Camera* camera, glm::mat4 model)
 	this->shader->setUniform("u_abs_coeff", this->abs_coeff);
 	this->shader->setUniform("u_scat_coeff", this->scat_coeff);
 	this->shader->setUniform("u_local_camera_position", local_camera_pos);
-	this->shader->setUniform("u_step_size", this->step_size);
+	this->shader->setUniform("u_step_size",
+		this->dicomMode ? this->dicomStepSize : this->step_size);
 	this->shader->setUniform("u_emission_color", glm::vec3(this->color.x, this->color.y, this->color.z));
-	this->shader->setUniform("u_volume_texture", this->texture, 0);
+	if (this->dicomMode)
+	{
+		this->shader->setUniform("u_volume_texture", 0);
+		this->shader->setUniform("u_padding_texture", 1);
+		this->shader->setUniform("u_window_center", this->dicomWindowCenter);
+		this->shader->setUniform("u_window_width", this->dicomWindowWidth);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_3D, this->dicomIntensityTexture);
+		glActiveTexture(GL_TEXTURE1);
+		glBindTexture(GL_TEXTURE_3D, this->dicomPaddingTexture);
+		glActiveTexture(GL_TEXTURE0);
+	}
+	else
+	{
+		this->shader->setUniform("u_volume_texture", this->texture, 0);
+	}
 	this->shader->setUniform("u_g", this->g);
 	Application::instance->light_list[0]->setUniforms(this->shader, model);
 }
@@ -68,27 +86,36 @@ void VolumeMaterial::renderInMenu()
 		"Lab 4: Scattering"
 	};
 
-	if (ImGui::Combo("Shader Type", &shader_index, shader_names,IM_ARRAYSIZE(shader_names))) {
+	if (!this->dicomMode &&
+		ImGui::Combo("Shader Type", &shader_index, shader_names, IM_ARRAYSIZE(shader_names))) {
 		switch (shader_index) {
 		case 0:
-			shader = Shader::Get("res/shaders/basic.vs", "res/shaders/homogeneous.fs");
+			this->vdbShader = Shader::Get("res/shaders/basic.vs", "res/shaders/homogeneous.fs");
 			break;
 		case 1:
-			shader = Shader::Get("res/shaders/basic.vs", "res/shaders/heterogeneous.fs");
+			this->vdbShader = Shader::Get("res/shaders/basic.vs", "res/shaders/heterogeneous.fs");
 			break;
 
 		case 2:
-			shader = Shader::Get("res/shaders/basic.vs", "res/shaders/emissionabsorption.fs");
+			this->vdbShader = Shader::Get("res/shaders/basic.vs", "res/shaders/emissionabsorption.fs");
 			break;
 		case 3:
-			shader = Shader::Get("res/shaders/basic.vs", "res/shaders/scattering.fs");
+			this->vdbShader = Shader::Get("res/shaders/basic.vs", "res/shaders/scattering.fs");
 			break;
 		}
+		this->shader = this->vdbShader;
 	}
 
 	ImGui::Text("Material Type: %s", std::string("Volume").c_str());
+	if (this->dicomMode)
+		ImGui::Text("Active source: DICOM CT (windowed grayscale transfer)");
+	else
+		ImGui::Text("Active source: VDB");
 	ImGui::SliderFloat("Absorption coefficient", &abs_coeff, 0.0, 5.0);
-	ImGui::SliderFloat("Step size", &step_size, 0.001, 2);
+	if (this->dicomMode)
+		ImGui::SliderFloat("DICOM step size", &this->dicomStepSize, 0.001f, 0.1f);
+	else
+		ImGui::SliderFloat("Step size", &step_size, 0.001f, 2.f);
 	if (shader_index == 2) {
 		ImGui::ColorEdit3("Emissive color", (float*)&this->color);
 	}
@@ -97,6 +124,26 @@ void VolumeMaterial::renderInMenu()
 		ImGui::SliderFloat("Scattering coefficient", &scat_coeff, 0.0, 5.0);
 		ImGui::SliderFloat("Isotropy", &g, -1.0, 1.0);
 	}
+}
+
+void VolumeMaterial::useDicomVolume(GLuint intensityTexture, GLuint paddingTexture,
+	float windowCenter, float windowWidth, float stepSize)
+{
+	this->dicomIntensityTexture = intensityTexture;
+	this->dicomPaddingTexture = paddingTexture;
+	this->dicomWindowCenter = windowCenter;
+	this->dicomWindowWidth = std::max(1.f, windowWidth);
+	this->dicomStepSize = stepSize;
+	this->dicomMode = true;
+	this->shader = this->dicomShader;
+}
+
+void VolumeMaterial::useVdbVolume()
+{
+	this->dicomMode = false;
+	this->shader = this->vdbShader;
+	this->dicomIntensityTexture = 0;
+	this->dicomPaddingTexture = 0;
 }
 
 void VolumeMaterial::loadVDB(std::string file_path)

@@ -40,7 +40,9 @@ void Application::init(GLFWwindow* window)
     // Add the volume node
     SceneNode* volume = new SceneNode("Volume Node");
     volume->mesh = Mesh::Get("res/meshes/cube.obj");
-    volume->material = new VolumeMaterial();
+    this->volumeMaterial = new VolumeMaterial();
+    volume->material = this->volumeMaterial;
+    this->volumeNode = volume;
     this->node_list.push_back(volume);
 
 	// Add light source to list of nodes and lights
@@ -104,11 +106,19 @@ void Application::renderGUI()
                 this->dicomPreviewAcquisition = -1;
                 this->dicomPreviewSliceIndex = -1;
                 this->dicomSliceStatus.clear();
+                this->dicomVolume = {};
+                this->dicomVolumeStatus.clear();
+                this->dicomVolumeReady = false;
+                this->releaseDicomVolumeTexture();
             }
             else
             {
                 this->dicomFolderStatus = std::move(errorMessage);
                 this->dicomFolderLoaded = false;
+                this->dicomVolume = {};
+                this->dicomVolumeReady = false;
+                this->dicomVolumeStatus.clear();
+                this->releaseDicomVolumeTexture();
             }
         }
 
@@ -136,6 +146,14 @@ void Application::renderGUI()
                     &this->selectedDicomAcquisition, acquisitionLabels.data(),
                     static_cast<int>(acquisitionLabels.size()));
 
+                if (acquisitionChanged)
+                {
+                    this->dicomVolume = {};
+                    this->dicomVolumeStatus.clear();
+                    this->dicomVolumeReady = false;
+                    this->releaseDicomVolumeTexture();
+                }
+
                 const DicomAcquisitionSummary& selected =
                     this->dicomFolderInspection.acquisitions[this->selectedDicomAcquisition];
                 ImGui::Text("Slices: %zu | Image size: %u x %u",
@@ -155,6 +173,164 @@ void Application::renderGUI()
                 if (selected.multiFrameInstanceCount > 0)
                     ImGui::TextColored(ImVec4(1.f, 0.65f, 0.2f, 1.f),
                         "Multi-frame instances not supported yet: %zu", selected.multiFrameInstanceCount);
+                if (selected.hasConsistentGeometry)
+                {
+                    const double voxelCount = static_cast<double>(selected.rows) *
+                        selected.columns * selected.sliceCount;
+                    const double estimatedMiB = voxelCount *
+                        (sizeof(float) + sizeof(unsigned char)) / (1024.0 * 1024.0);
+                    ImGui::Text("Full-resolution CPU memory estimate: %.1f MiB", estimatedMiB);
+                    if (ImGui::Button("Assemble CPU volume"))
+                    {
+                        DicomVolume assembled;
+                        std::string errorMessage;
+                        if (DicomMetadataReader::assembleVolume(selected, assembled, errorMessage))
+                        {
+                            this->dicomVolume = std::move(assembled);
+                            this->dicomVolumeStatus.clear();
+                            this->dicomVolumeReady = true;
+                            this->releaseDicomVolumeTexture();
+                        }
+                        else
+                        {
+                            this->dicomVolume = {};
+                            this->dicomVolumeStatus = std::move(errorMessage);
+                            this->dicomVolumeReady = false;
+                            this->releaseDicomVolumeTexture();
+                        }
+                    }
+                }
+                else
+                {
+                    ImGui::TextWrapped("Volume assembly is disabled because this acquisition does not have validated regular geometry.");
+                }
+                if (!this->dicomVolumeStatus.empty())
+                    ImGui::TextColored(ImVec4(1.f, 0.35f, 0.35f, 1.f),
+                        "%s", this->dicomVolumeStatus.c_str());
+                if (this->dicomVolumeReady)
+                {
+                    ImGui::Text("CPU volume assembled: %u x %u x %u voxels",
+                        this->dicomVolume.width, this->dicomVolume.height,
+                        this->dicomVolume.depth);
+                    ImGui::Text("Voxel spacing (column, row, slice): %.6f, %.6f, %.6f mm",
+                        this->dicomVolume.columnSpacingMm,
+                        this->dicomVolume.rowSpacingMm,
+                        std::sqrt(
+                            this->dicomVolume.sliceStepVectorMm[0] *
+                                this->dicomVolume.sliceStepVectorMm[0] +
+                            this->dicomVolume.sliceStepVectorMm[1] *
+                                this->dicomVolume.sliceStepVectorMm[1] +
+                            this->dicomVolume.sliceStepVectorMm[2] *
+                                this->dicomVolume.sliceStepVectorMm[2]));
+                    if (this->dicomVolume.hasNonPaddingVoxels)
+                        ImGui::Text("Modality value range (excluding padding): %.1f to %.1f",
+                            this->dicomVolume.minimumValue, this->dicomVolume.maximumValue);
+                    else
+                        ImGui::Text("The assembled volume contains only padding voxels.");
+
+                    GLint maximumTextureSize = 0;
+                    glGetIntegerv(GL_MAX_3D_TEXTURE_SIZE, &maximumTextureSize);
+                    const bool dimensionsFitGpu =
+                        maximumTextureSize > 0 &&
+                        this->dicomVolume.width <= static_cast<unsigned int>(maximumTextureSize) &&
+                        this->dicomVolume.height <= static_cast<unsigned int>(maximumTextureSize) &&
+                        this->dicomVolume.depth <= static_cast<unsigned int>(maximumTextureSize);
+                    const double requiredGpuMiB =
+                        (static_cast<double>(this->dicomVolume.modalityValues.size()) *
+                            sizeof(float) + this->dicomVolume.paddingMask.size()) /
+                        (1024.0 * 1024.0);
+                    ImGui::Text("GPU texture estimate (R32F values + R8 padding mask): %.1f MiB",
+                        requiredGpuMiB);
+                    ImGui::Text("Maximum 3D texture dimension: %d", maximumTextureSize);
+                    if (dimensionsFitGpu)
+                    {
+                        if (ImGui::Button("Upload 3D texture to GPU"))
+                            this->uploadDicomVolumeTexture();
+                    }
+                    else
+                    {
+                        ImGui::TextWrapped("This volume exceeds the GPU's maximum 3D texture dimension.");
+                    }
+                    if (this->dicomVolumeUploaded)
+                    {
+                        ImGui::Text("GPU upload complete (%.1f MiB); GL_LINEAR intensity filtering enabled.",
+                            this->dicomGpuTextureMiB);
+                        if (this->volumeMaterial->dicomMode)
+                        {
+                            if (ImGui::Button("Use VDB bunny"))
+                            {
+                                this->volumeMaterial->useVdbVolume();
+                                this->volumeNode->model = glm::mat4(1.f);
+                            }
+                        }
+                        else if (ImGui::Button("Render CT volume"))
+                        {
+                            const std::array<double, 3> columnVector = {
+                                this->dicomVolume.orientation[0] *
+                                    this->dicomVolume.columnSpacingMm * this->dicomVolume.width,
+                                this->dicomVolume.orientation[1] *
+                                    this->dicomVolume.columnSpacingMm * this->dicomVolume.width,
+                                this->dicomVolume.orientation[2] *
+                                    this->dicomVolume.columnSpacingMm * this->dicomVolume.width
+                            };
+                            const std::array<double, 3> rowVector = {
+                                this->dicomVolume.orientation[3] *
+                                    this->dicomVolume.rowSpacingMm * this->dicomVolume.height,
+                                this->dicomVolume.orientation[4] *
+                                    this->dicomVolume.rowSpacingMm * this->dicomVolume.height,
+                                this->dicomVolume.orientation[5] *
+                                    this->dicomVolume.rowSpacingMm * this->dicomVolume.height
+                            };
+                            const std::array<double, 3>& sliceVector =
+                                this->dicomVolume.sliceStepVectorMm;
+                            const double columnLength = std::sqrt(
+                                columnVector[0] * columnVector[0] +
+                                columnVector[1] * columnVector[1] +
+                                columnVector[2] * columnVector[2]);
+                            const double rowLength = std::sqrt(
+                                rowVector[0] * rowVector[0] +
+                                rowVector[1] * rowVector[1] +
+                                rowVector[2] * rowVector[2]);
+                            const double sliceLength = std::sqrt(
+                                sliceVector[0] * sliceVector[0] +
+                                sliceVector[1] * sliceVector[1] +
+                                sliceVector[2] * sliceVector[2]) * this->dicomVolume.depth;
+                            const double maximumExtent =
+                                std::max({ columnLength, rowLength, sliceLength });
+                            const float modelScale = static_cast<float>(2.0 / maximumExtent);
+                            glm::mat4 model(1.f);
+                            model[0] = glm::vec4(
+                                static_cast<float>(columnVector[0]) * modelScale * 0.5f,
+                                static_cast<float>(columnVector[1]) * modelScale * 0.5f,
+                                static_cast<float>(columnVector[2]) * modelScale * 0.5f, 0.f);
+                            model[1] = glm::vec4(
+                                static_cast<float>(rowVector[0]) * modelScale * 0.5f,
+                                static_cast<float>(rowVector[1]) * modelScale * 0.5f,
+                                static_cast<float>(rowVector[2]) * modelScale * 0.5f, 0.f);
+                            model[2] = glm::vec4(
+                                static_cast<float>(sliceVector[0] * this->dicomVolume.depth) *
+                                    modelScale * 0.5f,
+                                static_cast<float>(sliceVector[1] * this->dicomVolume.depth) *
+                                    modelScale * 0.5f,
+                                static_cast<float>(sliceVector[2] * this->dicomVolume.depth) *
+                                    modelScale * 0.5f, 0.f);
+                            const unsigned int maximumDimension = std::max({
+                                this->dicomVolume.width,
+                                this->dicomVolume.height,
+                                this->dicomVolume.depth });
+                            this->volumeMaterial->useDicomVolume(
+                                this->dicomVolumeTexture,
+                                this->dicomPaddingTexture,
+                                this->dicomWindowCenter,
+                                this->dicomWindowWidth,
+                                2.f / static_cast<float>(maximumDimension));
+                            this->volumeNode->model = model;
+                        }
+                    }
+                    if (!this->dicomGpuTextureStatus.empty())
+                        ImGui::TextColored(ImVec4(1.f, 0.35f, 0.35f, 1.f),
+                            "%s", this->dicomGpuTextureStatus.c_str());
+                }
                 if (acquisitionChanged || this->dicomPreviewAcquisition != this->selectedDicomAcquisition)
                     this->loadDicomPreviewSlice(selected, 0);
 
@@ -192,7 +368,7 @@ void Application::renderGUI()
                             "%s", this->dicomSliceStatus.c_str());
                     }
                 }
-                ImGui::TextWrapped("This step decodes and previews one 2D slice. It does not assemble or render a 3D volume yet.");
+                ImGui::TextWrapped("The CT volume can be rendered after upload. Use VDB bunny to return to the original VDB volume.");
             }
         }
         ImGui::TreePop();
@@ -311,10 +487,118 @@ void Application::updateDicomPreviewTexture()
 	this->dicomSliceStatus.clear();
 }
 
+void Application::releaseDicomVolumeTexture()
+{
+	if (this->volumeMaterial && this->volumeMaterial->dicomMode)
+	{
+		this->volumeMaterial->useVdbVolume();
+		if (this->volumeNode)
+			this->volumeNode->model = glm::mat4(1.f);
+	}
+	const GLuint textures[] = { this->dicomVolumeTexture, this->dicomPaddingTexture };
+	glDeleteTextures(2, textures);
+	this->dicomVolumeTexture = 0;
+	this->dicomPaddingTexture = 0;
+	this->dicomVolumeUploaded = false;
+	this->dicomGpuTextureMiB = 0.0;
+	this->dicomGpuTextureStatus.clear();
+}
+
+void Application::uploadDicomVolumeTexture()
+{
+	if (!this->dicomVolumeReady ||
+		this->dicomVolume.modalityValues.empty() ||
+		this->dicomVolume.width == 0 ||
+		this->dicomVolume.height == 0 ||
+		this->dicomVolume.depth == 0)
+	{
+		this->dicomGpuTextureStatus = "Assemble a valid CPU volume before uploading it.";
+		return;
+	}
+
+	GLint maximumTextureSize = 0;
+	glGetIntegerv(GL_MAX_3D_TEXTURE_SIZE, &maximumTextureSize);
+	if (maximumTextureSize <= 0 ||
+		this->dicomVolume.width > static_cast<unsigned int>(maximumTextureSize) ||
+		this->dicomVolume.height > static_cast<unsigned int>(maximumTextureSize) ||
+		this->dicomVolume.depth > static_cast<unsigned int>(maximumTextureSize))
+	{
+		this->dicomGpuTextureStatus = "The volume dimensions exceed the GPU's maximum 3D texture size.";
+		return;
+	}
+
+	const GLenum existingError = glGetError();
+	if (existingError != GL_NO_ERROR)
+	{
+		this->dicomGpuTextureStatus = "OpenGL already has an outstanding error; resolve it before uploading the CT volume.";
+		return;
+	}
+
+	this->releaseDicomVolumeTexture();
+	GLuint textures[2] = {};
+	glGenTextures(2, textures);
+	if (textures[0] == 0 || textures[1] == 0)
+	{
+		glDeleteTextures(2, textures);
+		this->dicomGpuTextureStatus = "OpenGL could not allocate texture objects for the CT volume and padding mask.";
+		return;
+	}
+
+	glBindTexture(GL_TEXTURE_3D, textures[0]);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 0);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 0);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glTexImage3D(GL_TEXTURE_3D, 0, GL_R32F,
+		static_cast<GLsizei>(this->dicomVolume.width),
+		static_cast<GLsizei>(this->dicomVolume.height),
+		static_cast<GLsizei>(this->dicomVolume.depth),
+		0, GL_RED, GL_FLOAT, this->dicomVolume.modalityValues.data());
+	glBindTexture(GL_TEXTURE_3D, textures[1]);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 0);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 0);
+	glTexImage3D(GL_TEXTURE_3D, 0, GL_R8,
+		static_cast<GLsizei>(this->dicomVolume.width),
+		static_cast<GLsizei>(this->dicomVolume.height),
+		static_cast<GLsizei>(this->dicomVolume.depth),
+		0, GL_RED, GL_UNSIGNED_BYTE, this->dicomVolume.paddingMask.data());
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+	glBindTexture(GL_TEXTURE_3D, 0);
+
+	const GLenum uploadError = glGetError();
+	if (uploadError != GL_NO_ERROR)
+	{
+		glDeleteTextures(2, textures);
+		this->dicomGpuTextureStatus = uploadError == GL_OUT_OF_MEMORY
+			? "The GPU ran out of memory while allocating or uploading the full-resolution CT texture."
+			: "OpenGL reported an error while uploading the CT 3D texture.";
+		return;
+	}
+
+	this->dicomVolumeTexture = textures[0];
+	this->dicomPaddingTexture = textures[1];
+	this->dicomVolumeUploaded = true;
+	this->dicomGpuTextureMiB =
+		(static_cast<double>(this->dicomVolume.modalityValues.size()) *
+			sizeof(float) + this->dicomVolume.paddingMask.size()) /
+		(1024.0 * 1024.0);
+	this->dicomGpuTextureStatus.clear();
+}
+
 Application::~Application()
 {
 	if (this->dicomPreviewTexture != 0)
 		glDeleteTextures(1, &this->dicomPreviewTexture);
+	this->releaseDicomVolumeTexture();
 }
 
 void Application::shutdown() { }

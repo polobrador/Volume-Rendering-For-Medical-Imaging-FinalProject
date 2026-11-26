@@ -1,11 +1,72 @@
 #include "dicom/dicom_metadata_reader.h"
 
 #include <algorithm>
+#include <charconv>
+#include <cmath>
 #include <iostream>
 #include <limits>
 
 int main(int argc, char* argv[])
 {
+	if (argc == 4 && std::string(argv[1]) == "--assemble-volume")
+	{
+		unsigned int acquisitionIndex = 0;
+		const std::string indexArgument(argv[3]);
+		const auto [indexEnd, indexError] = std::from_chars(
+			indexArgument.data(), indexArgument.data() + indexArgument.size(),
+			acquisitionIndex);
+		if (indexError != std::errc{} ||
+			indexEnd != indexArgument.data() + indexArgument.size() ||
+			acquisitionIndex == 0)
+		{
+			std::cerr << "The acquisition index must be a positive 1-based integer.\n";
+			return 2;
+		}
+
+		DicomFolderInspection inspection;
+		std::string errorMessage;
+		if (!DicomMetadataReader::inspectFolder(argv[2], inspection, errorMessage))
+		{
+			std::cerr << "DICOM folder inspection failed: " << errorMessage << '\n';
+			return 1;
+		}
+		if (acquisitionIndex > inspection.acquisitions.size())
+		{
+			std::cerr << "Acquisition index " << acquisitionIndex << " is outside the detected range 1-"
+				<< inspection.acquisitions.size() << ".\n";
+			return 2;
+		}
+
+		const DicomAcquisitionSummary& acquisition =
+			inspection.acquisitions[acquisitionIndex - 1];
+		DicomVolume volume;
+		if (!DicomMetadataReader::assembleVolume(acquisition, volume, errorMessage))
+		{
+			std::cerr << "DICOM volume assembly failed: " << errorMessage << '\n';
+			return 1;
+		}
+
+		const size_t allocatedBytes =
+			volume.modalityValues.size() * sizeof(float) + volume.paddingMask.size();
+		std::cout << "Assembled acquisition " << acquisitionIndex << ": "
+			<< volume.width << 'x' << volume.height << 'x' << volume.depth << " voxels\n"
+			<< "Voxel spacing (column, row, slice): "
+			<< volume.columnSpacingMm << ", " << volume.rowSpacingMm << ", "
+			<< std::sqrt(
+				volume.sliceStepVectorMm[0] * volume.sliceStepVectorMm[0] +
+				volume.sliceStepVectorMm[1] * volume.sliceStepVectorMm[1] +
+				volume.sliceStepVectorMm[2] * volume.sliceStepVectorMm[2])
+			<< " mm\n";
+		if (volume.hasNonPaddingVoxels)
+			std::cout << "Modality value range (excluding padding): "
+				<< volume.minimumValue << " to " << volume.maximumValue << '\n';
+		else
+			std::cout << "The volume contains only padding voxels.\n";
+		std::cout << "CPU storage: " << allocatedBytes / (1024.0 * 1024.0)
+			<< " MiB (modality values plus padding mask)\n";
+		return 0;
+	}
+
 	if (argc == 3 && std::string(argv[1]) == "--inspect-folder")
 	{
 		DicomFolderInspection inspection;
@@ -72,6 +133,7 @@ int main(int argc, char* argv[])
 		std::cerr << "Usage:\n"
 			<< "  DICOMMetadataReport <input.dcm-or-folder> <output.txt>\n"
 			<< "  DICOMMetadataReport --inspect-folder <folder>\n"
+			<< "  DICOMMetadataReport --assemble-volume <folder> <acquisition-index>\n"
 			<< "  DICOMMetadataReport --inspect-slice <file.dcm>\n";
 		return 2;
 	}

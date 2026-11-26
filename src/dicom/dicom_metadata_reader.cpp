@@ -15,6 +15,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <new>
 #include <set>
 #include <sstream>
 #include <utility>
@@ -435,7 +436,11 @@ namespace
 		std::stable_sort(slices.begin(), slices.end(), [hasOrientation, &referenceOrientation](
 			const SliceMetadata& left, const SliceMetadata& right)
 		{
-			if (hasOrientation && left.position.size() == 3 && right.position.size() == 3)
+			const bool leftHasPosition = left.position.size() == 3;
+			const bool rightHasPosition = right.position.size() == 3;
+			if (leftHasPosition != rightHasPosition)
+				return leftHasPosition;
+			if (hasOrientation && leftHasPosition)
 			{
 				const double normalX = referenceOrientation[1] * referenceOrientation[5] -
 					referenceOrientation[2] * referenceOrientation[4];
@@ -449,7 +454,7 @@ namespace
 					right.position[1] * normalY + right.position[2] * normalZ;
 				return leftCoordinate < rightCoordinate;
 			}
-			return left.seriesKey < right.seriesKey;
+			return left.path < right.path;
 		});
 
 		const SliceMetadata& first = slices.front();
@@ -529,14 +534,44 @@ namespace
 			consistentGeometry = consistentGeometry && summary.hasRegularSliceSpacing;
 			if (uniqueCoordinates.size() >= 2 && referenceOrientation.size() == 6)
 			{
-				const double normalX = referenceOrientation[1] * referenceOrientation[5] -
-					referenceOrientation[2] * referenceOrientation[4];
-				const double normalY = referenceOrientation[2] * referenceOrientation[3] -
-					referenceOrientation[0] * referenceOrientation[5];
-				const double normalZ = referenceOrientation[0] * referenceOrientation[4] -
-					referenceOrientation[1] * referenceOrientation[3];
-				summary.sliceStepVectorMm = { normalX * summary.meanSliceSpacingMm,
-					normalY * summary.meanSliceSpacingMm, normalZ * summary.meanSliceSpacingMm };
+				std::array<double, 3> totalStep{};
+				bool allPositionsAvailable = true;
+				for (size_t index = 1; index < slices.size(); ++index)
+				{
+					if (slices[index - 1].position.size() != 3 ||
+						slices[index].position.size() != 3)
+					{
+						allPositionsAvailable = false;
+						break;
+					}
+					for (size_t axis = 0; axis < totalStep.size(); ++axis)
+						totalStep[axis] += slices[index].position[axis] -
+							slices[index - 1].position[axis];
+				}
+
+				if (allPositionsAvailable)
+				{
+					const double intervalCount = static_cast<double>(slices.size() - 1);
+					for (size_t axis = 0; axis < totalStep.size(); ++axis)
+						summary.sliceStepVectorMm[axis] = totalStep[axis] / intervalCount;
+
+					for (size_t index = 1; index < slices.size(); ++index)
+					{
+						for (size_t axis = 0; axis < totalStep.size(); ++axis)
+						{
+							const double step = slices[index].position[axis] -
+								slices[index - 1].position[axis];
+							const double tolerance = std::max(0.01,
+								std::abs(summary.sliceStepVectorMm[axis]) * 0.01);
+							if (std::abs(step - summary.sliceStepVectorMm[axis]) > tolerance)
+								consistentGeometry = false;
+						}
+					}
+				}
+				else
+				{
+					consistentGeometry = false;
+				}
 			}
 		}
 		else
@@ -741,6 +776,25 @@ bool DicomMetadataReader::decodeMonochromeSlice(
 	DicomSlicePixels decoded;
 	decoded.rows = rows;
 	decoded.columns = columns;
+	const std::vector<double> position =
+		parseComponents(tagValue(stringFilter, dataSet, gdcm::Tag(0x0020, 0x0032)));
+	const std::vector<double> orientation =
+		parseComponents(tagValue(stringFilter, dataSet, gdcm::Tag(0x0020, 0x0037)));
+	const std::vector<double> pixelSpacing =
+		parseComponents(tagValue(stringFilter, dataSet, gdcm::Tag(0x0028, 0x0030)));
+	if (position.size() == decoded.originMm.size())
+		std::copy(position.begin(), position.end(), decoded.originMm.begin());
+	if (orientation.size() == decoded.orientation.size())
+		std::copy(orientation.begin(), orientation.end(), decoded.orientation.begin());
+	if (pixelSpacing.size() == 2)
+	{
+		decoded.rowSpacingMm = pixelSpacing[0];
+		decoded.columnSpacingMm = pixelSpacing[1];
+	}
+	decoded.hasGeometry = position.size() == decoded.originMm.size() &&
+		orientation.size() == decoded.orientation.size() &&
+		pixelSpacing.size() == 2 &&
+		decoded.rowSpacingMm > 0.0 && decoded.columnSpacingMm > 0.0;
 	decoded.monochrome1 = photometric == "MONOCHROME1";
 	decoded.modalityValues.resize(pixelCount);
 	decoded.paddingMask.assign(pixelCount, 0);
@@ -799,6 +853,179 @@ bool DicomMetadataReader::decodeMonochromeSlice(
 			? std::max(1.0, maximumValue - minimumValue) : 1.0;
 
 	slice = std::move(decoded);
+	return true;
+}
+
+bool DicomMetadataReader::assembleVolume(
+	const DicomAcquisitionSummary& acquisition,
+	DicomVolume& volume,
+	std::string& errorMessage)
+{
+	errorMessage.clear();
+	if (!acquisition.hasConsistentGeometry)
+	{
+		errorMessage = "The selected acquisition does not have consistent, regular slice geometry.";
+		return false;
+	}
+	if (acquisition.orderedFiles.size() < 2 ||
+		acquisition.orderedFiles.size() != acquisition.sliceCount)
+	{
+		errorMessage = "At least two spatially ordered single-frame slices are required.";
+		return false;
+	}
+	if (acquisition.multiFrameInstanceCount != 0 ||
+		acquisition.duplicatePositionCount != 0 ||
+		acquisition.rows == 0 || acquisition.columns == 0 ||
+		acquisition.rowSpacingMm <= 0.0 || acquisition.columnSpacingMm <= 0.0 ||
+		acquisition.meanSliceSpacingMm <= 0.0)
+	{
+		errorMessage = "The acquisition contains unsupported frames, duplicate positions, or invalid dimensions/spacing.";
+		return false;
+	}
+
+	const size_t width = acquisition.columns;
+	const size_t height = acquisition.rows;
+	const size_t depth = acquisition.orderedFiles.size();
+	if (depth > std::numeric_limits<unsigned int>::max())
+	{
+		errorMessage = "The slice count exceeds the supported volume depth.";
+		return false;
+	}
+	if (width > std::numeric_limits<size_t>::max() / height)
+	{
+		errorMessage = "The volume dimensions exceed the supported memory size.";
+		return false;
+	}
+	const size_t sliceVoxelCount = width * height;
+	if (depth > std::numeric_limits<size_t>::max() / sliceVoxelCount)
+	{
+		errorMessage = "The volume dimensions exceed the supported memory size.";
+		return false;
+	}
+	const size_t voxelCount = sliceVoxelCount * depth;
+	if (voxelCount > std::vector<float>().max_size() ||
+		voxelCount > std::vector<unsigned char>().max_size())
+	{
+		errorMessage = "The volume exceeds the supported memory size.";
+		return false;
+	}
+
+	DicomVolume assembled;
+	assembled.width = acquisition.columns;
+	assembled.height = acquisition.rows;
+	assembled.depth = static_cast<unsigned int>(depth);
+	assembled.originMm = acquisition.originMm;
+	assembled.orientation = acquisition.orientation;
+	assembled.sliceStepVectorMm = acquisition.sliceStepVectorMm;
+	assembled.rowSpacingMm = acquisition.rowSpacingMm;
+	assembled.columnSpacingMm = acquisition.columnSpacingMm;
+
+	try
+	{
+		assembled.modalityValues.reserve(voxelCount);
+		assembled.paddingMask.reserve(voxelCount);
+	}
+	catch (const std::bad_alloc&)
+	{
+		errorMessage = "Not enough memory to allocate the full-resolution CT volume.";
+		return false;
+	}
+
+	const double positionToleranceMm = std::max(
+		0.02, acquisition.meanSliceSpacingMm * 0.01);
+	double minimumValue = std::numeric_limits<double>::max();
+	double maximumValue = std::numeric_limits<double>::lowest();
+	for (size_t sliceIndex = 0; sliceIndex < depth; ++sliceIndex)
+	{
+		DicomSlicePixels decoded;
+		std::string decodeError;
+		bool decodedSuccessfully = false;
+		try
+		{
+			decodedSuccessfully = decodeMonochromeSlice(
+				acquisition.orderedFiles[sliceIndex], decoded, decodeError);
+		}
+		catch (const std::bad_alloc&)
+		{
+			errorMessage = "Not enough memory while decoding slice " +
+				std::to_string(sliceIndex + 1) + " of " + std::to_string(depth) + ".";
+			return false;
+		}
+		if (!decodedSuccessfully)
+		{
+			errorMessage = "Could not decode slice " + std::to_string(sliceIndex + 1) +
+				" of " + std::to_string(depth) + ": " + decodeError;
+			return false;
+		}
+		if (!decoded.hasGeometry)
+		{
+			errorMessage = "Slice " + std::to_string(sliceIndex + 1) +
+				" is missing required patient-space geometry.";
+			return false;
+		}
+		if (decoded.rows != acquisition.rows || decoded.columns != acquisition.columns)
+		{
+			errorMessage = "Slice " + std::to_string(sliceIndex + 1) +
+				" dimensions changed after folder inspection.";
+			return false;
+		}
+		for (size_t index = 0; index < decoded.orientation.size(); ++index)
+		{
+			if (std::abs(decoded.orientation[index] - acquisition.orientation[index]) > 1e-4)
+			{
+				errorMessage = "Slice " + std::to_string(sliceIndex + 1) +
+					" orientation differs from the inspected acquisition.";
+				return false;
+			}
+		}
+		if (std::abs(decoded.rowSpacingMm - acquisition.rowSpacingMm) > 1e-5 ||
+			std::abs(decoded.columnSpacingMm - acquisition.columnSpacingMm) > 1e-5)
+		{
+			errorMessage = "Slice " + std::to_string(sliceIndex + 1) +
+				" pixel spacing differs from the inspected acquisition.";
+			return false;
+		}
+		for (size_t axis = 0; axis < decoded.originMm.size(); ++axis)
+		{
+			const double expectedPosition = acquisition.originMm[axis] +
+				static_cast<double>(sliceIndex) * acquisition.sliceStepVectorMm[axis];
+			if (std::abs(decoded.originMm[axis] - expectedPosition) > positionToleranceMm)
+			{
+				errorMessage = "Slice " + std::to_string(sliceIndex + 1) +
+					" position does not fit the regular volume grid.";
+				return false;
+			}
+		}
+
+		for (size_t index = 0; index < sliceVoxelCount; ++index)
+		{
+			if (!decoded.paddingMask[index])
+			{
+				minimumValue = std::min<double>(minimumValue, decoded.modalityValues[index]);
+				maximumValue = std::max<double>(maximumValue, decoded.modalityValues[index]);
+			}
+		}
+		try
+		{
+			assembled.modalityValues.insert(assembled.modalityValues.end(),
+				decoded.modalityValues.begin(), decoded.modalityValues.end());
+			assembled.paddingMask.insert(assembled.paddingMask.end(),
+				decoded.paddingMask.begin(), decoded.paddingMask.end());
+		}
+		catch (const std::bad_alloc&)
+		{
+			errorMessage = "Not enough memory to assemble the full-resolution CT volume.";
+			return false;
+		}
+	}
+
+	assembled.hasNonPaddingVoxels = minimumValue <= maximumValue;
+	if (assembled.hasNonPaddingVoxels)
+	{
+		assembled.minimumValue = minimumValue;
+		assembled.maximumValue = maximumValue;
+	}
+	volume = std::move(assembled);
 	return true;
 }
 

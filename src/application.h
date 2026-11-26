@@ -9,6 +9,8 @@
 #include <array>
 #include <glm/vec2.hpp>
 
+class VolumeMaterial;
+
 class Application
 {
 public:
@@ -16,6 +18,8 @@ public:
 	
 	static Camera* camera;
 	std::vector<SceneNode*> node_list;
+	SceneNode* volumeNode = nullptr;
+	VolumeMaterial* volumeMaterial = nullptr;
 	glm::vec4 ambient_light;
 	glm::vec3 background_color;
 	std::vector<Light*> light_list;
@@ -36,13 +40,21 @@ public:
 	int selectedDicomAcquisition = 0;
 	bool dicomFolderLoaded = false;
 	DicomSlicePixels dicomSlicePixels;
+	DicomVolume dicomVolume;
 	std::string dicomSliceStatus;
+	std::string dicomVolumeStatus;
+	std::string dicomGpuTextureStatus;
 	GLuint dicomPreviewTexture = 0;
+	GLuint dicomVolumeTexture = 0;
+	GLuint dicomPaddingTexture = 0;
 	bool dicomSliceReady = false;
+	bool dicomVolumeReady = false;
+	bool dicomVolumeUploaded = false;
 	int dicomPreviewAcquisition = -1;
 	int dicomPreviewSliceIndex = -1;
 	float dicomWindowCenter = 40.f;
 	float dicomWindowWidth = 350.f;
+	double dicomGpuTextureMiB = 0.0;
 
 	void init(GLFWwindow* window);
 	void update(float dt);
@@ -66,4 +78,6 @@ public:
 private:
 	void loadDicomPreviewSlice(const DicomAcquisitionSummary& acquisition, int sliceIndex);
 	void updateDicomPreviewTexture();
+	void releaseDicomVolumeTexture();
+	void uploadDicomVolumeTexture();
 };

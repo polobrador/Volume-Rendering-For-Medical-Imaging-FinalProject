@@ -35,9 +35,20 @@ public:
 	int shader_index = 0;
 	float scat_coeff = 0.5;
 	float g = 0.0;
+	bool dicomMode = false;
+	GLuint dicomIntensityTexture = 0;
+	GLuint dicomPaddingTexture = 0;
+	float dicomWindowCenter = 40.f;
+	float dicomWindowWidth = 350.f;
+	float dicomStepSize = 0.004f;
+	Shader* vdbShader = NULL;
+	Shader* dicomShader = NULL;
 
 	void setUniforms(Camera* camera, glm::mat4 model) override;
 	void render(Mesh* mesh, glm::mat4 model, Camera* camera) override;
+	void useDicomVolume(GLuint intensityTexture, GLuint paddingTexture,
+		float windowCenter, float windowWidth, float stepSize);
+	void useVdbVolume();
 
 	void loadVDB(std::string file_path);
 	void estimate3DTexture(easyVDB::OpenVDBReader* vdbReader);

@@ -12,9 +12,10 @@ Run the tool from the project root:
 ./build/DICOMMetadataReport path/to/image.dcm-or-series-folder res/DICOM/metadata_report.txt
 ./build/DICOMMetadataReport --inspect-folder path/to/series-folder
 ./build/DICOMMetadataReport --inspect-slice path/to/image.dcm
+./build/DICOMMetadataReport --assemble-volume path/to/series-folder 1
 ```
 
-The framework's **DICOM CT Folder Inspection** panel accepts a folder path, lists separate series/acquisition groups, and shows their geometry. Select an acquisition and slice to preview its 2D image; window center and width can be adjusted. For example, `res/DICOM/.../series-000003` reports two acquisition groups (217 and 284 slices). This step decodes one monochrome 2D slice at a time; it does not assemble or render a 3D volume. The metadata and slice readers are separate components so a future DICOM browser can reuse them without depending on the rendering application.
+The framework's **DICOM CT Folder Inspection** panel accepts a folder path, lists separate series/acquisition groups, and shows their geometry. Select an acquisition and slice to preview its 2D image; window center and width can be adjusted. Click **Assemble CPU volume** to decode and stack every slice of a geometry-validated acquisition in patient-space order. Then click **Upload 3D texture to GPU** to allocate a full-resolution `R32F` intensity texture with `GL_LINEAR` filtering and a separate `R8` pixel-padding mask. The panel checks the GPU's maximum 3D texture dimension and reports upload errors. After upload, **Render CT volume** switches the scene's volume material to the CT ray marcher; **Use VDB bunny** switches back to the original VDB source. CT intensity is mapped to density using the current window center and width. For example, `res/DICOM/.../series-000003` reports two acquisition groups (217 and 284 slices). The CLI `--assemble-volume` command takes a 1-based acquisition index from the folder inspection output. The metadata and pixel readers are separate components so a future DICOM browser can reuse them without depending on the rendering application.
 
 ## Build Guide:
  
