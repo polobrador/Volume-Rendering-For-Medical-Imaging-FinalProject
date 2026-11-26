@@ -1,5 +1,6 @@
 #include "dicom_metadata_reader.h"
 
+#include <gdcmImageReader.h>
 #include <gdcmReader.h>
 #include <gdcmStringFilter.h>
 #include <gdcmTag.h>
@@ -8,12 +9,15 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <set>
 #include <sstream>
+#include <utility>
 #include <vector>
 
 namespace
@@ -63,6 +67,7 @@ namespace
 
 	struct SliceMetadata
 	{
+		std::filesystem::path path;
 		std::string seriesKey;
 		std::map<std::string, std::string> values;
 		std::vector<double> position;
@@ -141,6 +146,7 @@ namespace
 
 	bool readSlice(const std::filesystem::path& path, SliceMetadata& slice)
 	{
+		slice.path = path;
 		std::set<gdcm::Tag> selectedTags = {
 			seriesInstanceUidTag,
 			modalityTag
@@ -352,6 +358,448 @@ namespace
 		if (!hasVaryingTags)
 			report << "\nNo other selected metadata values vary across slices.\n";
 	}
+
+	double parseScalar(const std::string& value, double fallback = 0.0)
+	{
+		try
+		{
+			size_t parsedLength = 0;
+			const double parsed = std::stod(value, &parsedLength);
+			return parsedLength == value.size() && std::isfinite(parsed) ? parsed : fallback;
+		}
+		catch (const std::exception&)
+		{
+			return fallback;
+		}
+	}
+
+	bool sameComponents(const std::vector<double>& left,
+		const std::vector<double>& right, double tolerance)
+	{
+		if (left.size() != right.size())
+			return false;
+		for (size_t index = 0; index < left.size(); ++index)
+		{
+			if (std::abs(left[index] - right[index]) > tolerance)
+				return false;
+		}
+		return true;
+	}
+
+	std::string acquisitionGroupKey(const SliceMetadata& slice)
+	{
+		const std::string acquisition = valueFor(slice, 0x0020, 0x0012);
+		const std::string temporalPosition = valueFor(slice, 0x0020, 0x0100);
+		return slice.seriesKey + '\x1f' +
+			(acquisition.empty() ? "<unspecified>" : acquisition) + '\x1f' +
+			(temporalPosition.empty() ? "<unspecified>" : temporalPosition);
+	}
+
+	std::string makeAcquisitionLabel(const std::vector<SliceMetadata>& slices)
+	{
+		const SliceMetadata& first = slices.front();
+		std::ostringstream label;
+		label << "CT";
+		const std::string seriesNumber = valueFor(first, 0x0020, 0x0011);
+		const std::string description = valueFor(first, 0x0008, 0x103e);
+		const std::string protocol = valueFor(first, 0x0018, 0x1030);
+		const std::string acquisition = valueFor(first, 0x0020, 0x0012);
+		const std::string temporalPosition = valueFor(first, 0x0020, 0x0100);
+		if (!seriesNumber.empty())
+			label << " series " << seriesNumber;
+		if (!description.empty())
+			label << " - " << description;
+		else if (!protocol.empty())
+			label << " - " << protocol;
+		label << " - acquisition " << displayValue(acquisition);
+		if (!temporalPosition.empty())
+			label << ", time " << temporalPosition;
+		label << " (" << slices.size() << " slices)";
+		return label.str();
+	}
+
+	DicomAcquisitionSummary summarizeAcquisition(std::vector<SliceMetadata>& slices)
+	{
+		DicomAcquisitionSummary summary;
+		summary.sliceCount = slices.size();
+		summary.label = makeAcquisitionLabel(slices);
+		if (slices.empty())
+			return summary;
+
+		const auto firstPositioned = std::find_if(slices.begin(), slices.end(),
+			[](const SliceMetadata& slice) { return slice.hasSliceCoordinate; });
+		const bool hasOrientation = firstPositioned != slices.end() &&
+			firstPositioned->orientation.size() == 6;
+		const std::vector<double> referenceOrientation =
+			hasOrientation ? firstPositioned->orientation : std::vector<double>();
+		std::stable_sort(slices.begin(), slices.end(), [hasOrientation, &referenceOrientation](
+			const SliceMetadata& left, const SliceMetadata& right)
+		{
+			if (hasOrientation && left.position.size() == 3 && right.position.size() == 3)
+			{
+				const double normalX = referenceOrientation[1] * referenceOrientation[5] -
+					referenceOrientation[2] * referenceOrientation[4];
+				const double normalY = referenceOrientation[2] * referenceOrientation[3] -
+					referenceOrientation[0] * referenceOrientation[5];
+				const double normalZ = referenceOrientation[0] * referenceOrientation[4] -
+					referenceOrientation[1] * referenceOrientation[3];
+				const double leftCoordinate = left.position[0] * normalX +
+					left.position[1] * normalY + left.position[2] * normalZ;
+				const double rightCoordinate = right.position[0] * normalX +
+					right.position[1] * normalY + right.position[2] * normalZ;
+				return leftCoordinate < rightCoordinate;
+			}
+			return left.seriesKey < right.seriesKey;
+		});
+
+		const SliceMetadata& first = slices.front();
+		const double rowsValue = parseScalar(valueFor(first, 0x0028, 0x0010));
+		const double columnsValue = parseScalar(valueFor(first, 0x0028, 0x0011));
+		summary.rows = rowsValue > 0.0 ? static_cast<unsigned int>(rowsValue) : 0;
+		summary.columns = columnsValue > 0.0 ? static_cast<unsigned int>(columnsValue) : 0;
+		const std::vector<double> pixelSpacing =
+			parseComponents(valueFor(first, 0x0028, 0x0030));
+		if (pixelSpacing.size() == 2)
+		{
+			summary.rowSpacingMm = pixelSpacing[0];
+			summary.columnSpacingMm = pixelSpacing[1];
+		}
+		if (hasOrientation)
+		{
+			for (size_t index = 0; index < summary.orientation.size(); ++index)
+				summary.orientation[index] = referenceOrientation[index];
+		}
+		if (first.position.size() == 3)
+		{
+			for (size_t index = 0; index < summary.originMm.size(); ++index)
+				summary.originMm[index] = first.position[index];
+		}
+
+		bool consistentGeometry = hasOrientation && first.position.size() == 3 &&
+			summary.rows > 0 && summary.columns > 0 &&
+			summary.rowSpacingMm > 0.0 && summary.columnSpacingMm > 0.0;
+		std::vector<double> coordinates;
+		std::vector<double> referenceSpacing = pixelSpacing;
+		size_t multiFrameCount = 0;
+		for (const SliceMetadata& slice : slices)
+		{
+			const double frameCount = parseScalar(valueFor(slice, 0x0028, 0x0008), 1.0);
+			if (frameCount > 1.0)
+				++multiFrameCount;
+
+			consistentGeometry = consistentGeometry &&
+				parseScalar(valueFor(slice, 0x0028, 0x0010)) == summary.rows &&
+				parseScalar(valueFor(slice, 0x0028, 0x0011)) == summary.columns &&
+				sameComponents(slice.orientation, referenceOrientation, 1e-4) &&
+				sameComponents(parseComponents(valueFor(slice, 0x0028, 0x0030)),
+					referenceSpacing, 1e-5) &&
+				slice.position.size() == 3;
+
+			summary.orderedFiles.push_back(slice.path);
+			if (slice.hasSliceCoordinate)
+				coordinates.push_back(slice.sliceCoordinate);
+		}
+		summary.multiFrameInstanceCount = multiFrameCount;
+
+		std::sort(coordinates.begin(), coordinates.end());
+		std::vector<double> uniqueCoordinates;
+		for (double coordinate : coordinates)
+		{
+			if (uniqueCoordinates.empty() ||
+				std::abs(coordinate - uniqueCoordinates.back()) > 0.01)
+				uniqueCoordinates.push_back(coordinate);
+			else
+				++summary.duplicatePositionCount;
+		}
+
+		std::vector<double> gaps;
+		for (size_t index = 1; index < uniqueCoordinates.size(); ++index)
+			gaps.push_back(uniqueCoordinates[index] - uniqueCoordinates[index - 1]);
+		if (!gaps.empty())
+		{
+			const auto [minimumGap, maximumGap] = std::minmax_element(gaps.begin(), gaps.end());
+			double gapSum = 0.0;
+			for (double gap : gaps)
+				gapSum += gap;
+			summary.minimumSliceSpacingMm = *minimumGap;
+			summary.maximumSliceSpacingMm = *maximumGap;
+			summary.meanSliceSpacingMm = gapSum / gaps.size();
+			summary.hasRegularSliceSpacing =
+				*maximumGap - *minimumGap <= std::max(0.01, summary.meanSliceSpacingMm * 0.01);
+			consistentGeometry = consistentGeometry && summary.hasRegularSliceSpacing;
+			if (uniqueCoordinates.size() >= 2 && referenceOrientation.size() == 6)
+			{
+				const double normalX = referenceOrientation[1] * referenceOrientation[5] -
+					referenceOrientation[2] * referenceOrientation[4];
+				const double normalY = referenceOrientation[2] * referenceOrientation[3] -
+					referenceOrientation[0] * referenceOrientation[5];
+				const double normalZ = referenceOrientation[0] * referenceOrientation[4] -
+					referenceOrientation[1] * referenceOrientation[3];
+				summary.sliceStepVectorMm = { normalX * summary.meanSliceSpacingMm,
+					normalY * summary.meanSliceSpacingMm, normalZ * summary.meanSliceSpacingMm };
+			}
+		}
+		else
+		{
+			consistentGeometry = false;
+		}
+
+		consistentGeometry = consistentGeometry &&
+			summary.duplicatePositionCount == 0 &&
+			summary.multiFrameInstanceCount == 0 &&
+			uniqueCoordinates.size() == slices.size();
+		summary.hasConsistentGeometry = consistentGeometry;
+		return summary;
+	}
+}
+
+bool DicomMetadataReader::inspectFolder(
+	const std::filesystem::path& folderPath,
+	DicomFolderInspection& inspection,
+	std::string& errorMessage)
+{
+	errorMessage.clear();
+	if (folderPath.empty())
+	{
+		errorMessage = "Enter a folder path containing DICOM files.";
+		return false;
+	}
+
+	std::error_code pathError;
+	if (!std::filesystem::is_directory(folderPath, pathError) || pathError)
+	{
+		errorMessage = "The input path is not a readable folder.";
+		return false;
+	}
+
+	DicomFolderInspection result;
+	std::map<std::string, std::vector<SliceMetadata>> groups;
+	std::filesystem::recursive_directory_iterator iterator(folderPath, pathError);
+	const std::filesystem::recursive_directory_iterator end;
+	if (pathError)
+	{
+		errorMessage = "Could not open the selected folder.";
+		return false;
+	}
+
+	for (; iterator != end; iterator.increment(pathError))
+	{
+		if (pathError)
+		{
+			errorMessage = "Could not scan every file in the selected folder.";
+			return false;
+		}
+		if (!iterator->is_regular_file(pathError))
+			continue;
+		const std::string extension = iterator->path().extension().string();
+		if (extension == ".txt" || extension == ".TXT" ||
+			iterator->path().filename() == ".DS_Store")
+			continue;
+
+		SliceMetadata slice;
+		if (!readSlice(iterator->path(), slice))
+		{
+			++result.unreadableFiles;
+			continue;
+		}
+		if (valueFor(slice, 0x0008, 0x0060) != "CT")
+		{
+			++result.nonCtFiles;
+			continue;
+		}
+
+		groups[acquisitionGroupKey(slice)].push_back(std::move(slice));
+	}
+	if (pathError)
+	{
+		errorMessage = "Could not scan every file in the selected folder.";
+		return false;
+	}
+	if (groups.empty())
+	{
+		errorMessage = "No readable CT DICOM instances were found in this folder.";
+		return false;
+	}
+
+	result.acquisitions.reserve(groups.size());
+	for (auto& group : groups)
+		result.acquisitions.push_back(summarizeAcquisition(group.second));
+
+	std::sort(result.acquisitions.begin(), result.acquisitions.end(),
+		[](const DicomAcquisitionSummary& left, const DicomAcquisitionSummary& right)
+		{
+			return left.label < right.label;
+		});
+
+	inspection = std::move(result);
+	return true;
+}
+
+bool DicomMetadataReader::decodeMonochromeSlice(
+	const std::filesystem::path& filePath,
+	DicomSlicePixels& slice,
+	std::string& errorMessage)
+{
+	errorMessage.clear();
+	gdcm::ImageReader reader;
+	const std::string nativePath = filePath.string();
+	reader.SetFileName(nativePath.c_str());
+	if (!reader.Read())
+	{
+		errorMessage = "GDCM could not read image pixels from the selected DICOM file.";
+		return false;
+	}
+
+	const gdcm::Image& image = reader.GetImage();
+	const gdcm::PixelFormat& pixelFormat = image.GetPixelFormat();
+	gdcm::StringFilter stringFilter;
+	stringFilter.SetFile(reader.GetFile());
+	const gdcm::DataSet& dataSet = reader.GetFile().GetDataSet();
+	const double numberOfFrames = parseScalar(
+		tagValue(stringFilter, dataSet, gdcm::Tag(0x0028, 0x0008)), 1.0);
+	if (numberOfFrames > 1.0 ||
+		(image.GetNumberOfDimensions() > 2 && image.GetDimension(2) > 1))
+	{
+		errorMessage = "Multi-frame DICOM images are not supported in this slice-preview step.";
+		return false;
+	}
+	if (pixelFormat.GetSamplesPerPixel() != 1)
+	{
+		errorMessage = "Only single-sample monochrome DICOM images are supported.";
+		return false;
+	}
+	if (pixelFormat.GetPixelRepresentation() > 1)
+	{
+		errorMessage = "The DICOM Pixel Representation value is invalid.";
+		return false;
+	}
+	const unsigned int bitsAllocated = pixelFormat.GetBitsAllocated();
+	const unsigned int bitsStored = pixelFormat.GetBitsStored();
+	const unsigned int highBit = pixelFormat.GetHighBit();
+	if ((bitsAllocated != 8 && bitsAllocated != 16) ||
+		bitsStored == 0 || bitsStored > bitsAllocated || highBit >= bitsAllocated ||
+		highBit + 1 < bitsStored)
+	{
+		errorMessage = "Only 8-bit or 16-bit DICOM pixel samples are supported.";
+		return false;
+	}
+
+	const std::string photometric = tagValue(
+		stringFilter, dataSet, gdcm::Tag(0x0028, 0x0004));
+	if (photometric != "MONOCHROME1" && photometric != "MONOCHROME2")
+	{
+		errorMessage = "Only MONOCHROME1 and MONOCHROME2 DICOM images are supported.";
+		return false;
+	}
+
+	const unsigned int rows = image.GetRows();
+	const unsigned int columns = image.GetColumns();
+	if (rows == 0 || columns == 0 ||
+		static_cast<size_t>(columns) > std::numeric_limits<size_t>::max() / rows)
+	{
+		errorMessage = "The DICOM image has invalid dimensions.";
+		return false;
+	}
+	const size_t pixelCount = static_cast<size_t>(rows) * columns;
+	const size_t bytesPerSample = bitsAllocated / 8;
+	if (pixelCount > std::numeric_limits<size_t>::max() / bytesPerSample)
+	{
+		errorMessage = "The DICOM image dimensions exceed the supported buffer size.";
+		return false;
+	}
+	const size_t bufferLength = pixelCount * bytesPerSample;
+	if (image.GetBufferLength() < bufferLength)
+	{
+		errorMessage = "The DICOM Pixel Data buffer is shorter than its image dimensions require.";
+		return false;
+	}
+
+	std::vector<char> pixelBuffer(bufferLength);
+	if (!image.GetBuffer(pixelBuffer.data()))
+	{
+		errorMessage = "GDCM could not decode the DICOM Pixel Data.";
+		return false;
+	}
+
+	const double slope = image.GetSlope();
+	const double intercept = image.GetIntercept();
+	if (!std::isfinite(slope) || !std::isfinite(intercept))
+	{
+		errorMessage = "The DICOM rescale slope or intercept is not a finite number.";
+		return false;
+	}
+
+	const std::vector<double> centers =
+		parseComponents(tagValue(stringFilter, dataSet, gdcm::Tag(0x0028, 0x1050)));
+	const std::vector<double> widths =
+		parseComponents(tagValue(stringFilter, dataSet, gdcm::Tag(0x0028, 0x1051)));
+	const std::vector<double> paddingValues =
+		parseComponents(tagValue(stringFilter, dataSet, gdcm::Tag(0x0028, 0x0120)));
+	const std::vector<double> paddingLimits =
+		parseComponents(tagValue(stringFilter, dataSet, gdcm::Tag(0x0028, 0x0121)));
+
+	DicomSlicePixels decoded;
+	decoded.rows = rows;
+	decoded.columns = columns;
+	decoded.monochrome1 = photometric == "MONOCHROME1";
+	decoded.modalityValues.resize(pixelCount);
+	decoded.paddingMask.assign(pixelCount, 0);
+
+	const unsigned int lowBit = highBit + 1 - bitsStored;
+	const std::uint32_t storedMask = (std::uint32_t{ 1 } << bitsStored) - 1;
+	const std::uint32_t signBit = std::uint32_t{ 1 } << (bitsStored - 1);
+	double minimumValue = std::numeric_limits<double>::max();
+	double maximumValue = std::numeric_limits<double>::lowest();
+	for (size_t index = 0; index < pixelCount; ++index)
+	{
+		std::uint32_t rawValue = 0;
+		if (bitsAllocated == 8)
+		{
+			rawValue = static_cast<unsigned char>(pixelBuffer[index]);
+		}
+		else
+		{
+			std::uint16_t sample = 0;
+			std::memcpy(&sample, pixelBuffer.data() + index * bytesPerSample, sizeof(sample));
+			rawValue = sample;
+		}
+
+		const std::uint32_t storedBits = (rawValue >> lowBit) & storedMask;
+		std::int32_t storedValue = static_cast<std::int32_t>(storedBits);
+		if (pixelFormat.GetPixelRepresentation() == 1 && (storedBits & signBit))
+			storedValue -= static_cast<std::int32_t>(std::uint32_t{ 1 } << bitsStored);
+
+		bool isPadding = !paddingValues.empty() && storedValue == paddingValues.front();
+		if (!paddingValues.empty() && !paddingLimits.empty())
+		{
+			const double lower = std::min(paddingValues.front(), paddingLimits.front());
+			const double upper = std::max(paddingValues.front(), paddingLimits.front());
+			isPadding = storedValue >= lower && storedValue <= upper;
+		}
+
+		const double modalityValue = storedValue * slope + intercept;
+		decoded.modalityValues[index] = static_cast<float>(modalityValue);
+		decoded.paddingMask[index] = isPadding ? 1 : 0;
+		if (!isPadding)
+		{
+			minimumValue = std::min(minimumValue, modalityValue);
+			maximumValue = std::max(maximumValue, modalityValue);
+		}
+	}
+
+	if (!centers.empty() && std::isfinite(centers.front()))
+		decoded.windowCenter = centers.front();
+	else
+		decoded.windowCenter = minimumValue <= maximumValue
+			? (minimumValue + maximumValue) * 0.5 : 0.0;
+	if (!widths.empty() && std::isfinite(widths.front()) && widths.front() > 0.0)
+		decoded.windowWidth = widths.front();
+	else
+		decoded.windowWidth = minimumValue <= maximumValue
+			? std::max(1.0, maximumValue - minimumValue) : 1.0;
+
+	slice = std::move(decoded);
+	return true;
 }
 
 bool DicomMetadataReader::writeReport(

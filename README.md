@@ -2,7 +2,7 @@
 
 ## DICOM Metadata Report
 
-The `DICOMMetadataReport` tool accepts one DICOM instance or a folder. For a folder, it searches recursively, groups CT instances by Series Instance UID, acquisition number, and temporal position, spatially orders slices when patient positions are available, and writes group-level metadata plus per-slice geometry to a human-readable report. It warns about repeated slice locations and geometry inconsistencies, since instances in a series are not always one simple volume. It intentionally excludes direct patient-identifying fields and does not decode or display Pixel Data.
+The `DICOMMetadataReport` tool accepts one DICOM instance or a folder. For a folder, it searches recursively, groups CT instances by Series Instance UID, acquisition number, and temporal position, spatially orders slices when patient positions are available, and writes group-level metadata plus per-slice geometry to a human-readable report. It warns about repeated slice locations and geometry inconsistencies, since instances in a series are not always one simple volume. It intentionally excludes direct patient-identifying fields.
 
 Install GDCM before configuring the project (for example, `brew install gdcm` on macOS or `sudo apt install libgdcm-dev` on Debian/Ubuntu). If CMake cannot locate a custom GDCM installation, set `GDCM_DIR` to the directory containing `GDCMConfig.cmake`.
 
@@ -10,9 +10,11 @@ Run the tool from the project root:
 
 ```console
 ./build/DICOMMetadataReport path/to/image.dcm-or-series-folder res/DICOM/metadata_report.txt
+./build/DICOMMetadataReport --inspect-folder path/to/series-folder
+./build/DICOMMetadataReport --inspect-slice path/to/image.dcm
 ```
 
-The metadata reader is a separate component so a future DICOM browser can reuse it without depending on the rendering application.
+The framework's **DICOM CT Folder Inspection** panel accepts a folder path, lists separate series/acquisition groups, and shows their geometry. Select an acquisition and slice to preview its 2D image; window center and width can be adjusted. For example, `res/DICOM/.../series-000003` reports two acquisition groups (217 and 284 slices). This step decodes one monochrome 2D slice at a time; it does not assemble or render a 3D volume. The metadata and slice readers are separate components so a future DICOM browser can reuse them without depending on the rendering application.
 
 ## Build Guide:
  

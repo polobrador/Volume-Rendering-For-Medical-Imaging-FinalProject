@@ -80,6 +80,7 @@ target_link_libraries(dicom_metadata PUBLIC gdcmMSFF)
 add_executable(${PROJECT_NAME} ${ACG_SOURCES} ${ACG_HEADERS})
 
 target_include_directories(${PROJECT_NAME} PUBLIC ${DIR_SOURCES})
+target_link_libraries(${PROJECT_NAME} PRIVATE dicom_metadata)
 
 add_executable(DICOMMetadataReport tools/dicom_metadata_report.cpp)
 target_link_libraries(DICOMMetadataReport PRIVATE dicom_metadata)

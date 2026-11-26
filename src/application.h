@@ -4,7 +4,9 @@
 #include "framework/camera.h"
 #include "framework/scenenode.h"
 #include "framework/light.h"
+#include "dicom/dicom_metadata_reader.h"
 
+#include <array>
 #include <glm/vec2.hpp>
 
 class Application
@@ -28,12 +30,26 @@ public:
 	bool dragging;
 	glm::vec2 mousePosition;
 	glm::vec2 lastMousePosition;
+	std::array<char, 1024> dicomFolderPath{};
+	DicomFolderInspection dicomFolderInspection;
+	std::string dicomFolderStatus;
+	int selectedDicomAcquisition = 0;
+	bool dicomFolderLoaded = false;
+	DicomSlicePixels dicomSlicePixels;
+	std::string dicomSliceStatus;
+	GLuint dicomPreviewTexture = 0;
+	bool dicomSliceReady = false;
+	int dicomPreviewAcquisition = -1;
+	int dicomPreviewSliceIndex = -1;
+	float dicomWindowCenter = 40.f;
+	float dicomWindowWidth = 350.f;
 
 	void init(GLFWwindow* window);
 	void update(float dt);
 	void render();
 	void renderGUI();
 	void shutdown();
+	~Application();
 
 	void onKeyDown(int key, int scancode);
 	void onKeyUp(int key, int scancode);
@@ -46,4 +62,8 @@ public:
 	void onMousePosition(double xpos, double ypos);
 	void onScroll(double xOffset, double yOffset);
 	void onWindowSize(int width, int height);
+
+private:
+	void loadDicomPreviewSlice(const DicomAcquisitionSummary& acquisition, int sliceIndex);
+	void updateDicomPreviewTexture();
 };
