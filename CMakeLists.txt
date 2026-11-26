@@ -17,6 +17,10 @@ endif()
 # enable FetchContent
 include(FetchContent)
 
+# DICOM metadata reader
+find_package(GDCM REQUIRED)
+include(${GDCM_USE_FILE})
+
 # download imguizmo
 FetchContent_Declare(
     imguizmo_h
@@ -66,9 +70,23 @@ ACG_SOURCES_APPEND(${DIR_SOURCES}/graphics)
 
 ACG_SOURCES_APPEND(${DIR_LIBS}/imguizmo)
 
+add_library(dicom_metadata STATIC
+    ${DIR_SOURCES}/dicom/dicom_metadata_reader.cpp
+    ${DIR_SOURCES}/dicom/dicom_metadata_reader.h
+)
+target_include_directories(dicom_metadata PUBLIC ${DIR_SOURCES})
+target_link_libraries(dicom_metadata PUBLIC gdcmMSFF)
+
 add_executable(${PROJECT_NAME} ${ACG_SOURCES} ${ACG_HEADERS})
 
 target_include_directories(${PROJECT_NAME} PUBLIC ${DIR_SOURCES})
+
+add_executable(DICOMMetadataReport tools/dicom_metadata_report.cpp)
+target_link_libraries(DICOMMetadataReport PRIVATE dicom_metadata)
+set_target_properties(dicom_metadata DICOMMetadataReport PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+)
 
 set_property(DIRECTORY ${DIR_ROOT} PROPERTY VS_STARTUP_PROJECT ${PROJECT_NAME})
 set_property(TARGET ${PROJECT_NAME} PROPERTY CXX_STANDARD 20)

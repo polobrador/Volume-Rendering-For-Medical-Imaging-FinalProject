@@ -1,5 +1,19 @@
 # Advanced Computer Graphics
 
+## DICOM Metadata Report
+
+The `DICOMMetadataReport` tool accepts one DICOM instance or a folder. For a folder, it searches recursively, groups CT instances by Series Instance UID, acquisition number, and temporal position, spatially orders slices when patient positions are available, and writes group-level metadata plus per-slice geometry to a human-readable report. It warns about repeated slice locations and geometry inconsistencies, since instances in a series are not always one simple volume. It intentionally excludes direct patient-identifying fields and does not decode or display Pixel Data.
+
+Install GDCM before configuring the project (for example, `brew install gdcm` on macOS or `sudo apt install libgdcm-dev` on Debian/Ubuntu). If CMake cannot locate a custom GDCM installation, set `GDCM_DIR` to the directory containing `GDCMConfig.cmake`.
+
+Run the tool from the project root:
+
+```console
+./build/DICOMMetadataReport path/to/image.dcm-or-series-folder res/DICOM/metadata_report.txt
+```
+
+The metadata reader is a separate component so a future DICOM browser can reuse it without depending on the rendering application.
+
 ## Build Guide:
  
 Clone and initialize the repository (you can do it via [Git](https://git-scm.com/downloads/win) or using [GitHub Desktop](https://desktop.github.com/download/)):
