@@ -4,7 +4,9 @@
 
 The `DICOMMetadataReport` tool accepts one DICOM instance or a folder. For a folder, it searches recursively, groups CT instances by Series Instance UID, acquisition number, and temporal position, spatially orders slices when patient positions are available, and writes group-level metadata plus per-slice geometry to a human-readable report. It warns about repeated slice locations and geometry inconsistencies, since instances in a series are not always one simple volume. It intentionally excludes direct patient-identifying fields.
 
-Install GDCM before configuring the project (for example, `brew install gdcm` on macOS or `sudo apt install libgdcm-dev` on Debian/Ubuntu). If CMake cannot locate a custom GDCM installation, set `GDCM_DIR` to the directory containing `GDCMConfig.cmake`.
+**Cloning this repository does not install GDCM.** It is a required external dependency: CMake calls `find_package(GDCM REQUIRED)` and stops configuration if it cannot find a compatible GDCM development installation. Install GDCM before configuring (for example, `brew install gdcm` on macOS or `sudo apt install libgdcm-dev` on Debian/Ubuntu). On Windows, install a GDCM development package compatible with your compiler and architecture. If CMake cannot locate a custom installation, set `GDCM_DIR` to the directory containing `GDCMConfig.cmake`.
+
+CMake downloads the small ImGuizmo source files during configuration, but it does not download or build GDCM. This is intentional: GDCM is a substantial native dependency, and relying on a preinstalled package avoids silently starting a lengthy, platform-specific dependency build.
 
 Run the tool from the project root:
 
